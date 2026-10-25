@@ -1,7 +1,7 @@
 # meta description: Melody — одна команда .music (песня — автор): карточка с кнопкой-ссылкой на песню и караоке-анимацией текста
 # meta developer: @unkxe
 
-__version__ = (2, 2, 1)
+__version__ = (2, 3, 1)
 
 import asyncio
 import bisect
@@ -52,6 +52,8 @@ NEXT_DATA = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.S)
 SPLIT = re.compile(r"\s+[-—–]\s+|\s*\|\s*|\s*,\s+")
 STRONG = 1.2
 OK_YT = 0.5
+GAP_MIN = 4.0
+CNT_MAX = 8
 
 # кандидат: (title, artist, album, id_or_url, score, ms, kind)
 DEE, YTB = "deezer", "youtube"
@@ -79,11 +81,11 @@ class Melody(loader.Module):
 
     @loader.command()
     async def music(self, message):
-        """<песня> [-автор] — (АВТОР ОБЯЗАТЕЛЬНО ПИШЕТСЯ ЧЕРЕЗ -) карточка песни: караоке, кнопка-ссылка и закрыть"""
+        """<песня> [- автор] — карточка песни: караоке, кнопка-ссылка и закрыть"""
         raw = (utils.get_args_raw(message) or "").strip()
         if not raw:
             return await utils.answer(
-                message, "🎛 Пример: .music целую тебя —cupsize (автор не обязателен)"
+                message, "🎛 Пример: .music целую тебя — капсайз (автор не обязателен)"
             )
         title, artist = self._split_args(raw)
 
@@ -137,25 +139,63 @@ class Melody(loader.Module):
 
     async def _karaoke(self, token, form, song):
         tl = song["timeline"]
+        if not tl:
+            return
+        synced = bool(song.get("synced"))
         times = [e["t"] for e in tl]
         last = len(tl) - 1
-        idx = 0
+        thr = self._gap_threshold(times)
+        shown = None
         fails = 0
         while self._token == token and self._form:
             elapsed = time.monotonic() - self._started + self._opt("offset", float, 0.0)
             if elapsed >= times[last] + 4.0:
                 await self._edit(form, self._screen(song, last, state="end"))
                 return
-            nn = max(0, min(bisect.bisect_right(times, elapsed) - 1, last))
-            if nn != idx:
-                idx = nn
-                if await self._edit(form, self._screen(song, idx, state="play")):
+            frame = None
+            if synced:
+                j = bisect.bisect_right(times, elapsed)
+                if j <= last:
+                    gap = times[j] - (times[j - 1] if j > 0 else 0.0)
+                    left = times[j] - elapsed
+                    if gap >= thr and 0 < left <= gap:
+                        if left > CNT_MAX:
+                            frame = ("hold", j)
+                        elif left > 0.05:
+                            frame = ("cnt", j, int(left - 0.05) + 1)
+            if frame is None:
+                i = max(0, min(bisect.bisect_right(times, elapsed) - 1, last))
+                frame = ("line", i)
+            if frame != shown:
+                shown = frame
+                if frame[0] == "cnt":
+                    ok = await self._edit(
+                        form, self._screen(song, frame[1], state="count", n=frame[2])
+                    )
+                elif frame[0] == "hold":
+                    ok = await self._edit(
+                        form, self._screen(song, frame[1], state="count")
+                    )
+                else:
+                    ok = await self._edit(
+                        form, self._screen(song, frame[1], state="play")
+                    )
+                if ok:
                     fails = 0
                 else:
                     fails += 1
                     if fails >= 6:
                         return
-            await asyncio.sleep(0.4)
+            await asyncio.sleep(0.35)
+
+    def _gap_threshold(self, times):
+        if len(times) < 3:
+            return GAP_MIN * 2
+        gaps = sorted(b - a for a, b in zip(times, times[1:]) if b - a > 0.2)
+        if not gaps:
+            return GAP_MIN * 2
+        med = gaps[len(gaps) // 2]
+        return max(GAP_MIN, min(12.0, med * 1.6 + 1.0))
 
     async def _edit(self, form, screen):
         try:
@@ -169,7 +209,7 @@ class Melody(loader.Module):
 
     # ── карточка ─────────────────────────────────────────────────
 
-    def _screen(self, song, idx, state="play"):
+    def _screen(self, song, idx, state="play", n=None):
         k = self.inline.screen()
         title = html.escape(str(song["title"]))
         artist = html.escape(str(song["artist"]))
@@ -179,12 +219,14 @@ class Melody(loader.Module):
         k.add("<h3>🎧 {}</h3>".format(title))
         k.add("<i>{} · {}</i>".format(artist, album) if album else "<i>{}</i>".format(artist))
         k.add("⎯" * 25)
-        k.add(self._lyrics_block(song, idx))
+        k.add(self._lyrics_block(song, idx, state=state, n=n))
         k.add("⎯" * 25)
         k.add('<tg-button type="url" url="{}">🔗 Слушать песню</tg-button>'.format(url))
         k.add(k.row(k.tap("🚫 Закрыть", self._close_cb, style="danger", force_me=True)))
         if state == "wait":
             k.add("<i>🔎 Ищу текст в открытых источниках…</i>")
+        elif state == "count":
+            k.add("<i>⏳ Инструментальная пауза — отсчёт до следующей строки</i>")
         elif state == "notext":
             k.add("<i>🌑 Текст не нашёлся — слушай по ссылке</i>")
         elif state == "end":
@@ -193,22 +235,26 @@ class Melody(loader.Module):
             k.add("<i>🎤 Жирная строка — её поют сейчас</i>")
         return k
 
-    def _lyrics_block(self, song, idx):
+    def _lyrics_block(self, song, idx, state="play", n=None):
         tl = song["timeline"]
         if not tl:
             return "<blockquote><i>текст появится, когда найду</i></blockquote>"
         win = max(1, min(6, self._opt("lines", int, 3)))
         idx = max(0, min(idx, len(tl) - 1))
         link = html.escape(str(song["url"]), quote=True)
-        rows = [
-            '<a href="{}">{}</a>'.format(link, html.escape(e["text"]))
-            for e in tl[max(0, idx - win):idx]
-        ]
+
+        def blue(e):
+            return '<a href="{}">{}</a>'.format(link, html.escape(e["text"]))
+
+        if state == "count":
+            rows = [blue(e) for e in tl[max(0, idx - win):idx]]
+            rows.append("<b>⏳ {}</b>".format(n) if n else "<b>⏳</b>")
+            rows += [blue(e) for e in tl[idx:idx + win]]
+            return "<blockquote>" + "<br>".join(rows) + "</blockquote>"
+
+        rows = [blue(e) for e in tl[max(0, idx - win):idx]]
         rows.append("<b>🎤 {}</b>".format(html.escape(tl[idx]["text"])))
-        rows += [
-            '<a href="{}">{}</a>'.format(link, html.escape(e["text"]))
-            for e in tl[idx + 1:idx + 1 + win]
-        ]
+        rows += [blue(e) for e in tl[idx + 1:idx + 1 + win]]
         return "<blockquote>" + "<br>".join(rows) + "</blockquote>"
 
     async def _close_cb(self, call):
@@ -560,9 +606,11 @@ class Melody(loader.Module):
 
     def _build_timeline(self, item, song):
         text = (item.get("text") or "").replace("\r", "")
+        song["synced"] = False
         if item.get("synced"):
             tl = self._parse_lrc(text)
             if tl:
+                song["synced"] = True
                 return tl
         lines = [l.strip() for l in text.splitlines() if l.strip()]
         if not lines:
