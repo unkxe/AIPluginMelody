@@ -1,7 +1,7 @@
 # meta description: Melody — одна команда .music (песня — автор): карточка с кнопкой-ссылкой на песню и караоке-анимацией текста
 # meta developer: @unkxe
 
-__version__ = (2, 3, 1)
+__version__ = (4, 0, 0)
 
 import asyncio
 import bisect
@@ -52,7 +52,7 @@ NEXT_DATA = re.compile(r'<script id="__NEXT_DATA__"[^>]*>(.*?)</script>', re.S)
 SPLIT = re.compile(r"\s+[-—–]\s+|\s*\|\s*|\s*,\s+")
 STRONG = 1.2
 OK_YT = 0.5
-GAP_MIN = 4.0
+GAP_ANIM = 8.0
 CNT_MAX = 8
 
 # кандидат: (title, artist, album, id_or_url, score, ms, kind)
@@ -144,7 +144,7 @@ class Melody(loader.Module):
         synced = bool(song.get("synced"))
         times = [e["t"] for e in tl]
         last = len(tl) - 1
-        thr = self._gap_threshold(times)
+        thr = GAP_ANIM
         shown = None
         fails = 0
         while self._token == token and self._form:
@@ -187,15 +187,6 @@ class Melody(loader.Module):
                     if fails >= 6:
                         return
             await asyncio.sleep(0.35)
-
-    def _gap_threshold(self, times):
-        if len(times) < 3:
-            return GAP_MIN * 2
-        gaps = sorted(b - a for a, b in zip(times, times[1:]) if b - a > 0.2)
-        if not gaps:
-            return GAP_MIN * 2
-        med = gaps[len(gaps) // 2]
-        return max(GAP_MIN, min(12.0, med * 1.6 + 1.0))
 
     async def _edit(self, form, screen):
         try:
