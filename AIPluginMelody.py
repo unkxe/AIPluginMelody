@@ -224,10 +224,7 @@ class Melody(loader.Module):
         url = html.escape(str(song["url"]), quote=True)
 
         k.add("<h3>🎧 {}</h3>".format(title))
-        meta = [k.badge(artist, icon="user")]
-        if album:
-            meta.append(k.badge(album))
-        k.add(k.row(*meta, align="center"))
+        k.add("<i>{} · {}</i>".format(artist, album) if album else "<i>{}</i>".format(artist))
         k.add("<hr>")
         k.add(self._lyrics_block(song, idx, state=state, n=n))
         k.add("<hr>")
