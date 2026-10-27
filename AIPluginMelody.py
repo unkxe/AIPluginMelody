@@ -1,7 +1,7 @@
 # meta description: Melody — одна команда .music (песня — автор): карточка с кнопкой-ссылкой на песню и караоке-анимацией текста
 # meta developer: @unkxe
 
-__version__ = (4, 0, 0)
+__version__ = (4, 1, 0)
 
 import asyncio
 import bisect
@@ -94,6 +94,8 @@ class Melody(loader.Module):
         token = self._token
 
         song = await self._resolve_track(raw, title, artist)
+        if self._token != token:
+            return
         if not song:
             return await utils.answer(
                 message, "🚫 Не нашёл «{}» ни в одном источнике. Уточни название".format(raw)
@@ -144,63 +146,77 @@ class Melody(loader.Module):
         synced = bool(song.get("synced"))
         times = [e["t"] for e in tl]
         last = len(tl) - 1
-        thr = GAP_ANIM
+        end_at = times[last] + 4.0
+        song["duration"] = max(song.get("ms") or 0, int(end_at * 1000))
+        offset = self._opt("offset", float, 0.0)
+        step = 0.5 if synced else 1.0
         shown = None
         fails = 0
         while self._token == token and self._form:
-            elapsed = time.monotonic() - self._started + self._opt("offset", float, 0.0)
-            if elapsed >= times[last] + 4.0:
-                await self._edit(form, self._screen(song, last, state="end"))
+            elapsed = time.monotonic() - self._started + offset
+            if elapsed >= end_at:
+                ok = await self._edit(form, self._screen(song, last, state="end"))
+                if not ok:
+                    fails += 1
+                    if fails >= 6:
+                        return
                 return
-            frame = None
-            if synced:
-                j = bisect.bisect_right(times, elapsed)
-                if j <= last:
-                    gap = times[j] - (times[j - 1] if j > 0 else 0.0)
-                    left = times[j] - elapsed
-                    if gap >= thr and 0 < left <= gap:
-                        if left > CNT_MAX:
-                            frame = ("hold", j)
-                        elif left > 0.05:
-                            frame = ("cnt", j, int(left - 0.05) + 1)
-            if frame is None:
-                i = max(0, min(bisect.bisect_right(times, elapsed) - 1, last))
-                frame = ("line", i)
+            state_, idx, count = self._frame(times, last, elapsed, synced)
+            prog = self._progress(elapsed, end_at)
+            tick = int(prog * 40)
+            frame = (state_, idx, count, tick)
             if frame != shown:
                 shown = frame
-                if frame[0] == "cnt":
-                    ok = await self._edit(
-                        form, self._screen(song, frame[1], state="count", n=frame[2])
-                    )
-                elif frame[0] == "hold":
-                    ok = await self._edit(
-                        form, self._screen(song, frame[1], state="count")
-                    )
-                else:
-                    ok = await self._edit(
-                        form, self._screen(song, frame[1], state="play")
-                    )
+                ok = await self._edit(
+                    form,
+                    self._screen(
+                        song,
+                        idx,
+                        state=state_,
+                        n=count,
+                        progress=prog,
+                    ),
+                )
                 if ok:
                     fails = 0
                 else:
                     fails += 1
                     if fails >= 6:
                         return
-            await asyncio.sleep(0.35)
+            await asyncio.sleep(step)
+
+    def _frame(self, times, last, elapsed, synced):
+        """Кадр (state, idx, n): пауза → hold/отсчёт, иначе текущая строка"""
+        if synced:
+            j = bisect.bisect_right(times, elapsed)
+            if j <= last:
+                gap = times[j] - (times[j - 1] if j > 0 else 0.0)
+                left = times[j] - elapsed
+                if gap >= GAP_ANIM and 0 < left <= gap:
+                    if left > CNT_MAX:
+                        return ("hold", j, None)
+                    if left > 0.05:
+                        return ("count", j, int(left - 0.05) + 1)
+        i = max(0, min(bisect.bisect_right(times, elapsed) - 1, last))
+        return ("play", i, None)
+
+    def _progress(self, elapsed, total):
+        if total <= 0:
+            return 0.0
+        return max(0.0, min(1.0, elapsed / total))
 
     async def _edit(self, form, screen):
         try:
-            await form.edit(rich_html=screen)
-            return True
+            return bool(await form.edit(rich_html=screen))
         except Exception as e:
-            wait = getattr(e, "seconds", 0)
+            wait = getattr(e, "seconds", 0) or getattr(e, "retry_after", 0)
             if wait:
                 await asyncio.sleep(min(float(wait), 8.0))
             return False
 
     # ── карточка ─────────────────────────────────────────────────
 
-    def _screen(self, song, idx, state="play", n=None):
+    def _screen(self, song, idx, state="play", n=None, progress=0.0):
         k = self.inline.screen()
         title = html.escape(str(song["title"]))
         artist = html.escape(str(song["artist"]))
@@ -208,23 +224,38 @@ class Melody(loader.Module):
         url = html.escape(str(song["url"]), quote=True)
 
         k.add("<h3>🎧 {}</h3>".format(title))
-        k.add("<i>{} · {}</i>".format(artist, album) if album else "<i>{}</i>".format(artist))
-        k.add("⎯" * 25)
+        meta = [k.badge(artist, icon="user")]
+        if album:
+            meta.append(k.badge(album))
+        k.add(k.row(*meta, align="center"))
+        k.add("<hr>")
         k.add(self._lyrics_block(song, idx, state=state, n=n))
-        k.add("⎯" * 25)
+        k.add("<hr>")
+        k.add(self._bar(progress))
         k.add('<tg-button type="url" url="{}">🔗 Слушать песню</tg-button>'.format(url))
         k.add(k.row(k.tap("🚫 Закрыть", self._close_cb, style="danger", force_me=True)))
         if state == "wait":
-            k.add("<i>🔎 Ищу текст в открытых источниках…</i>")
+            k.add("🔎 <i>Ищу текст в открытых источниках…</i>")
         elif state == "count":
-            k.add("<i>⏳ Инструментальная пауза — отсчёт до следующей строки</i>")
+            k.add("⏳ <i>Инструментальная пауза — отсчёт до следующей строки</i>")
+        elif state == "hold":
+            k.add("⏸ <i>В песне пауза — ждём следующую строку</i>")
         elif state == "notext":
-            k.add("<i>🌑 Текст не нашёлся — слушай по ссылке</i>")
+            k.add("🌑 <i>Текст не нашёлся — слушай по ссылке</i>")
         elif state == "end":
-            k.add("<i>🏁 Песня закончилась</i>")
+            k.add("🏁 <i>Песня закончилась</i>")
         else:
-            k.add("<i>🎤 Жирная строка — её поют сейчас</i>")
+            k.add("🎤 <i>Жирная строка — её поют сейчас</i>")
         return k
+
+    def _bar(self, progress):
+        cells = 16
+        filled = int(round(max(0.0, min(1.0, progress)) * cells))
+        if filled >= cells:
+            return "<code>{}</code>".format("▓" * cells)
+        left = "<code>{}</code>".format("▓" * filled) if filled else ""
+        right = "<code>{}</code>".format("░" * (cells - filled))
+        return "{}🔘{}".format(left, right)
 
     def _lyrics_block(self, song, idx, state="play", n=None):
         tl = song["timeline"]
@@ -237,15 +268,16 @@ class Melody(loader.Module):
         def blue(e):
             return '<a href="{}">{}</a>'.format(link, html.escape(e["text"]))
 
+        prev = [blue(e) for e in tl[max(0, idx - win):idx]]
+        after = [blue(e) for e in tl[idx + 1:idx + 1 + win]]
         if state == "count":
-            rows = [blue(e) for e in tl[max(0, idx - win):idx]]
-            rows.append("<b>⏳ {}</b>".format(n) if n else "<b>⏳</b>")
-            rows += [blue(e) for e in tl[idx:idx + win]]
+            head = "<b>⏳ {}</b>".format(n) if n else "<b>⏳</b>"
+            rows = prev + [head] + after
             return "<blockquote>" + "<br>".join(rows) + "</blockquote>"
-
-        rows = [blue(e) for e in tl[max(0, idx - win):idx]]
-        rows.append("<b>🎤 {}</b>".format(html.escape(tl[idx]["text"])))
-        rows += [blue(e) for e in tl[idx + 1:idx + 1 + win]]
+        if state == "hold":
+            rows = prev + ["<b>⏸ пауза…</b>"] + after
+            return "<blockquote>" + "<br>".join(rows) + "</blockquote>"
+        rows = prev + ["<b>🎤 {}</b>".format(html.escape(tl[idx]["text"]))] + after
         return "<blockquote>" + "<br>".join(rows) + "</blockquote>"
 
     async def _close_cb(self, call):
@@ -262,6 +294,10 @@ class Melody(loader.Module):
         self._form = None
         if task:
             task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
         if form:
             try:
                 await form.delete()
@@ -324,7 +360,7 @@ class Melody(loader.Module):
         for q in ([quick, title] if artist else self._variants(raw)):
             data = await self._api(DEEZER_SEARCH + urllib.parse.quote(q))
             pool = []
-            for t in (data or {}).get("data") or []:
+            for t in ((data or {}).get("data") or []) if isinstance(data, dict) else []:
                 if not (t.get("title") and t.get("id")):
                     continue
                 ct = t.get("title")
@@ -349,16 +385,24 @@ class Melody(loader.Module):
 
     async def _youtube_engine(self, q):
         tasks = [
-            asyncio.ensure_future(self._piped_once(base, q)) for base in PIPED
-        ] + [asyncio.ensure_future(self._inv_once(base, q)) for base in INV]
+            asyncio.create_task(self._piped_once(base, q)) for base in PIPED
+        ] + [asyncio.create_task(self._inv_once(base, q)) for base in INV]
         try:
             for fut in asyncio.as_completed(tasks):
-                pool = await fut
+                try:
+                    pool = await fut
+                except asyncio.CancelledError:
+                    raise
+                except Exception:
+                    continue
                 if pool:
                     return pool
-        except Exception:
-            pass
-        return None
+            return None
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _piped_once(self, base, query):
         for flt in ("music_songs", "videos"):
@@ -366,17 +410,31 @@ class Melody(loader.Module):
             data = await self._api(
                 base + "/search?filter=" + flt + "&q=" + urllib.parse.quote(query), 9
             )
-            for it in (data or {}).get("items") or []:
+            for it in ((data or {}).get("items") or []) if isinstance(data, dict) else []:
+                if not isinstance(it, dict):
+                    continue
                 u = it.get("url") or ""
                 if "/watch" not in u:
                     continue
+                if u.startswith("//"):
+                    track_url = "https:" + u
+                elif u.startswith("http://") or u.startswith("https://"):
+                    track_url = u
+                else:
+                    track_url = "https://www.youtube.com" + (
+                        u if u.startswith("/") else "/" + u
+                    )
+                try:
+                    duration_ms = max(0, int(float(it.get("duration") or 0))) * 1000
+                except (TypeError, ValueError, OverflowError):
+                    duration_ms = 0
                 pool.append([
                     it.get("title") or "",
                     (it.get("uploaderName") or "").replace(" - Topic", "").strip(),
                     "",
-                    "https://youtube.com" + u,
+                    track_url,
                     0.0,
-                    int(it.get("duration") or 0) * 1000,
+                    duration_ms,
                     YTB,
                 ])
             if pool:
@@ -392,13 +450,17 @@ class Melody(loader.Module):
             vid = it.get("videoId") or ""
             if not vid:
                 continue
+            try:
+                duration_ms = max(0, int(float(it.get("lengthSeconds") or 0))) * 1000
+            except (TypeError, ValueError, OverflowError):
+                duration_ms = 0
             pool.append([
                 (it.get("title") or "").strip(),
                 (it.get("author") or "").replace(" - Topic", "").strip(),
                 "",
-                "https://youtube.com/watch?v=" + vid,
+                "https://www.youtube.com/watch?v=" + urllib.parse.quote(str(vid), safe=""),
                 0.0,
-                int(it.get("lengthSeconds") or 0) * 1000,
+                duration_ms,
                 YTB,
             ])
         if pool:
@@ -422,10 +484,16 @@ class Melody(loader.Module):
             1, len(self._tokens(title_l))
         )
         phrase = 0.25 if title_l and title_l in ct.lower() else 0.0
+        candidate_artist = ca.lower().strip()
         art = (
             0.15
             if not artist_l
-            else (0.15 if artist_l in ca.lower() or ca.lower() in artist_l else 0.0)
+            else (
+                0.15
+                if candidate_artist
+                and (artist_l in candidate_artist or candidate_artist in artist_l)
+                else 0.0
+            )
         )
         return cov - pen + 0.15 * order + phrase + art
 
@@ -446,8 +514,10 @@ class Melody(loader.Module):
             et = urllib.parse.quote(q)
             for extra in ("", "&country=ru"):
                 data = await self._api(ITUNES_SEARCH + et + extra)
+                results = data.get("results", []) if isinstance(data, dict) else []
                 tracks = [
-                    r for r in (data or {}).get("results", []) if r.get("kind") == "track"
+                    r for r in results
+                    if isinstance(r, dict) and r.get("kind") == "track"
                 ]
                 if tracks:
                     tracks.sort(
@@ -568,7 +638,10 @@ class Melody(loader.Module):
     async def _lyrics_ovh(self, artist, title):
         if not artist or not title:
             return None
-        url = LYRICS_OVH.format(urllib.parse.quote(artist), urllib.parse.quote(title))
+        url = LYRICS_OVH.format(
+            urllib.parse.quote(str(artist), safe=""),
+            urllib.parse.quote(str(title), safe=""),
+        )
         data = await self._api(url, 12)
         text = ((data or {}).get("lyrics") or "").strip()
         if not text or text.lower().startswith("instrumental") or len(text) < 40:
@@ -576,11 +649,12 @@ class Melody(loader.Module):
         return {"synced": False, "text": text}
 
     async def _api_retry(self, url, tries=2, delay=1.5):
-        for i in range(tries):
+        for i in range(max(1, tries)):
             data = await self._api(url)
             if data is not None:
                 return data
-            await asyncio.sleep(delay)
+            if i + 1 < max(1, tries):
+                await asyncio.sleep(max(0.0, delay))
         return None
 
     def _pick(self, data):
@@ -623,8 +697,13 @@ class Melody(loader.Module):
                 if not m:
                     break
                 mm, ss, frac = m.groups()
+                seconds = int(ss)
+                if seconds >= 60:
+                    # Ignore this malformed timestamp and stop consuming tags.
+                    break
                 stamps.append(
-                    int(mm) * 60 + int(ss) + int(((frac or "0") + "000")[:3]) / 1000.0
+                    int(mm) * 60 + seconds
+                    + int(((frac or "0") + "000")[:3]) / 1000.0
                 )
                 s = s[m.end():]
             phrase = JUNK.sub("", s).strip()
