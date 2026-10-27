@@ -1,7 +1,7 @@
 # meta description: Melody — одна команда .music (песня — автор): карточка с кнопкой-ссылкой на песню и караоке-анимацией текста
 # meta developer: @unkxe
 
-__version__ = (4, 1, 0)
+__version__ = (4, 1, 1)
 
 import asyncio
 import bisect
@@ -149,11 +149,13 @@ class Melody(loader.Module):
         end_at = times[last] + 4.0
         song["duration"] = max(song.get("ms") or 0, int(end_at * 1000))
         offset = self._opt("offset", float, 0.0)
-        step = 0.5 if synced else 1.0
+        step = 1.0
         shown = None
+        last_bar = 0.0
         fails = 0
         while self._token == token and self._form:
-            elapsed = time.monotonic() - self._started + offset
+            now = time.monotonic()
+            elapsed = now - self._started + offset
             if elapsed >= end_at:
                 ok = await self._edit(form, self._screen(song, last, state="end"))
                 if not ok:
@@ -162,11 +164,11 @@ class Melody(loader.Module):
                         return
                 return
             state_, idx, count = self._frame(times, last, elapsed, synced)
-            prog = self._progress(elapsed, end_at)
-            tick = int(prog * 40)
-            frame = (state_, idx, count, tick)
-            if frame != shown:
+            frame = (state_, idx, count)
+            bar_due = now - last_bar >= 5.0
+            if frame != shown or bar_due:
                 shown = frame
+                last_bar = now
                 ok = await self._edit(
                     form,
                     self._screen(
@@ -174,7 +176,7 @@ class Melody(loader.Module):
                         idx,
                         state=state_,
                         n=count,
-                        progress=prog,
+                        progress=self._progress(elapsed, end_at),
                     ),
                 )
                 if ok:
