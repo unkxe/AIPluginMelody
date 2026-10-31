@@ -1,7 +1,7 @@
 # meta description: Melody — одна команда .music (песня — автор): карточка с кнопкой-ссылкой на песню и караоке-анимацией текста
 # meta developer: @unkxe
 
-__version__ = (4, 1, 1)
+__version__ = (4, 1, 3)
 
 import asyncio
 import bisect
@@ -11,6 +11,7 @@ import json
 import re
 import time
 import urllib.parse
+import urllib.error
 import urllib.request
 
 from .. import loader, utils
@@ -122,12 +123,14 @@ class Melody(loader.Module):
 
     async def _run(self, token, form, song, title, artist, raw):
         try:
+            self._api_failed = False
             item = await self._fetch_lyrics(song, title, artist, raw)
             if self._token != token or not self._form:
                 return
             song["timeline"] = self._build_timeline(item, song) if item else []
             if not song["timeline"]:
-                await self._edit(form, self._screen(song, 0, state="notext"))
+                state = "error" if getattr(self, "_api_failed", False) else "notext"
+                await self._edit(form, self._screen(song, 0, state=state))
                 return
             await self._edit(form, self._screen(song, 0, state="play"))
             if self._token != token or not self._form:
@@ -241,6 +244,8 @@ class Melody(loader.Module):
             k.add("⏸ <i>В песне пауза — ждём следующую строку</i>")
         elif state == "notext":
             k.add("🌑 <i>Текст не нашёлся — слушай по ссылке</i>")
+        elif state == "error":
+            k.add("⚠️ <b>Ошибка сервера, попробуйте позже</b>")
         elif state == "end":
             k.add("🏁 <i>Песня закончилась</i>")
         else:
@@ -726,13 +731,20 @@ class Melody(loader.Module):
             return await asyncio.get_running_loop().run_in_executor(
                 None, functools.partial(self._grab, url, timeout)
             )
-        except Exception:
+        except Exception as e:
+            if getattr(e, "code", None) and int(e.code) >= 500:
+                self._api_failed = True
             return None
 
     def _grab(self, url, timeout=8):
         req = urllib.request.Request(url, headers={"User-Agent": UA_API})
-        with urllib.request.urlopen(req, timeout=timeout) as resp:
-            return json.loads(resp.read().decode("utf-8", "replace"))
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return json.loads(resp.read().decode("utf-8", "replace"))
+        except urllib.error.HTTPError as e:
+            if int(e.code) >= 500:
+                self._api_failed = True
+            raise
 
     async def _page(self, url, timeout=12):
         try:
